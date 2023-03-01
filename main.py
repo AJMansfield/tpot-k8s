@@ -151,7 +151,8 @@ for container_dir in os.scandir(dock_dir):
     logger.info(f"scanning {container_dir.path}")
 
     compose_file = get_compose_file(container_dir)
-    out_file = os.path.join(out_dir, "_" + container_dir.name + ".tpl")
+    out_fname = "_" + container_dir.name + ".tpl"
+    out_file = os.path.join(out_dir, out_fname)
 
     logger.info(f"reading {compose_file.path}")
     logger.info(f"writing {out_file}")
@@ -171,12 +172,15 @@ for container_dir in os.scandir(dock_dir):
             stream.write('{{/* container spec and volumes for ' + service_name + ' */}}\n')
             
             stream.write('{{- define "' + service_name + '.containers" }}\n')
+            stream.write(f'## Source: {out_fname}\n')
             yaml.safe_dump([container], stream)
             stream.write('{{- end }}\n')
             stream.write('{{- define "' + service_name + '.volumes" }}\n')
+            stream.write(f'## Source: {out_fname}\n')
             yaml.safe_dump(list(volumes.values()), stream)
             stream.write('{{- end }}\n')
             stream.write('{{- define "' + service_name + '.extras" }}\n')
+            stream.write(f'## Source: {out_fname}\n')
             yaml.safe_dump_all(extras, stream)
             stream.write('{{- end }}\n')
 
