@@ -11,6 +11,13 @@ from slugify import slugify
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
 
+exclude_dirs = [
+    'p0f', 'fatt', 'suricata', 'elk', 'ewsposter', 'nginx', 'spiderfoot', 'deprecated'
+]
+ignore_volumes = [
+    'data',
+]
+
 def ensure_dir(path):
     try:
         os.makedirs(path)
@@ -55,6 +62,7 @@ def get_compose_file(dir):
 def convert_service(name, svc):
     container = {}
     volumes = {}
+    extras = []
 
     container['name'] = name
     container['image'] = svc['image']
@@ -68,7 +76,8 @@ def convert_service(name, svc):
         
         host_path, guest_path = vol_mount.split(":")
         pvc_name, pvc_path = host_path.removeprefix("/").split("/", 1)
-        vol_name = slugify(pvc_name)
+        pvc_name = slugify(pvc_name)
+        vol_name = pvc_name
 
         volumes[vol_name] = {
             'name': vol_name,
@@ -80,6 +89,27 @@ def convert_service(name, svc):
             'name': vol_name,
             'subPath': pvc_path,
             'mountPath': guest_path,
+            })
+        
+        if vol_name not in ignore_volumes:
+            extras.append({
+                'apiVersion': "v1",
+                'kind': "PersistentVolumeClaim",
+                'metadata': {
+                    'name': pvc_name_template.format(name=pvc_name),
+                    'namespace': "{{ .Release.Namespace }}",
+                    'labels' : {
+                        'app': "{{ .Release.Namespace }}"
+                    }
+                },
+                'spec': {
+                    'accessModes': ['ReadWriteOnce'],
+                    'resources': {
+                        'requests': {
+                            'storage': '100Mi'
+                        }
+                    }
+                }
             })
     
     for tmpfs_mount in svc.get('tmpfs', []):
@@ -111,11 +141,9 @@ def convert_service(name, svc):
             'mountPath': guest_path,
             })
     
-    return container, volumes
+    return container, volumes, extras
         
-exclude_dirs = [
-    'p0f', 'fatt', 'suricata', 'elk', 'ewsposter', 'nginx', 'spiderfoot', 'deprecated'
-]
+
 for container_dir in os.scandir(dock_dir):
     if not container_dir.is_dir() or container_dir.name in exclude_dirs:
         logger.info(f"skipping {container_dir.path}")
@@ -137,7 +165,7 @@ for container_dir in os.scandir(dock_dir):
     
     for service_name, service in services.items():
         service_name = slugify(service_name)
-        container, volumes = convert_service(service_name, service)
+        container, volumes, extras = convert_service(service_name, service)
 
         with open(out_file, 'a') as stream:
             stream.write('{{/* container spec and volumes for ' + service_name + ' */}}\n')
@@ -149,6 +177,7 @@ for container_dir in os.scandir(dock_dir):
             yaml.safe_dump(list(volumes.values()), stream)
             stream.write('{{- end }}\n')
             stream.write('{{- define "' + service_name + '.extras" }}\n')
+            yaml.safe_dump_all(extras, stream)
             stream.write('{{- end }}\n')
 
         
