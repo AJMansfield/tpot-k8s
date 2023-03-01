@@ -6,6 +6,7 @@ import tempfile
 import logging
 import re
 import yaml
+from slugify import slugify
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -19,8 +20,9 @@ def ensure_dir(path):
 
 src_repo = "https://github.com/telekom-security/tpotce.git"
 src_branch = "master"
+repo_url = src_repo.removesuffix(".git") + "/tree/" + src_branch
 
-pvc_name_template = "{{{{ $.Release.Name }}}}-{name}"
+pvc_name_template = "{{{{ .Release.Name }}}}-{name}"
 
 build_dir = os.path.join(os.path.dirname(__file__), "build")
 ensure_dir(build_dir)
@@ -66,7 +68,7 @@ def convert_service(name, svc):
         
         host_path, guest_path = vol_mount.split(":")
         pvc_name, pvc_path = host_path.removeprefix("/").split("/", 1)
-        vol_name = pvc_name
+        vol_name = slugify(pvc_name)
 
         volumes[vol_name] = {
             'name': vol_name,
@@ -87,7 +89,7 @@ def convert_service(name, svc):
         
         guest_path, attrs = tmpfs_mount.split(":")
         attrs = dict(map(lambda a: a.split("="), attrs.split(",")))
-        vol_name = guest_path.removeprefix("/").replace("/", "-")
+        vol_name = slugify(name + '-' + guest_path.removeprefix("/"))
 
         securityContext = {}
         if 'uid' in attrs:
@@ -119,29 +121,35 @@ for container_dir in os.scandir(dock_dir):
         logger.info(f"skipping {container_dir.path}")
         continue
     logger.info(f"scanning {container_dir.path}")
+
     compose_file = get_compose_file(container_dir)
+    out_file = os.path.join(out_dir, "_" + container_dir.name + ".tpl")
+
     logger.info(f"reading {compose_file.path}")
+    logger.info(f"writing {out_file}")
+    with open(out_file, 'w') as stream:
+        stream.write('{{/* derived from ' + repo_url + "/" + os.path.relpath(compose_file, git_dir) + ' */}}\n')
+
     with open(compose_file, "r") as stream:
         contents = yaml.safe_load(stream)
     
     services = contents.get('services',{})
-
-    containers = {}
-    volumes = {}
+    
     for service_name, service in services.items():
-        container, new_volumes = convert_service(service_name, service)
-        containers[service_name] = container
-        volumes.update(new_volumes)
+        service_name = slugify(service_name)
+        container, volumes = convert_service(service_name, service)
 
-    spec = {
-        'spec': {
-            'containers': list(containers.values()),
-            'volumes': list(volumes.values()),
-        },
-    }
+        with open(out_file, 'a') as stream:
+            stream.write('{{/* container spec and volumes for ' + service_name + ' */}}\n')
+            
+            stream.write('{{- define "' + service_name + '.containers" }}\n')
+            yaml.safe_dump([container], stream)
+            stream.write('{{- end }}\n')
+            stream.write('{{- define "' + service_name + '.volumes" }}\n')
+            yaml.safe_dump(list(volumes.values()), stream)
+            stream.write('{{- end }}\n')
+            stream.write('{{- define "' + service_name + '.extras" }}\n')
+            stream.write('{{- end }}\n')
 
-    out_file = os.path.join(out_dir, container_dir.name + ".yaml")
-    logger.info(f"writing {out_file}")
-    with open(out_file, 'w') as stream:
-        yaml.safe_dump(spec, stream)
+        
 
