@@ -7,69 +7,37 @@ import logging
 import re
 import yaml
 from slugify import slugify
+import argparse
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
-
-exclude_dirs = [
-    'p0f', 'fatt', 'suricata', 'elk', 'ewsposter', 'nginx', 'spiderfoot', 'deprecated'
-]
-ignore_volumes = [
-    'data',
-]
+def lerp(x0, x1, /, t):
+    return x0*(1-t) + x1*t
 
 def ensure_dir(path):
     try:
         os.makedirs(path)
-        logger.info(f"made dirs up to {path}")
+        logging.info(f"made dirs up to {path}")
     except FileExistsError:
-        logger.info(f"using existing {path}")
-
-src_repo = "https://github.com/telekom-security/tpotce.git"
-src_branch = "master"
-repo_url = src_repo.removesuffix(".git") + "/tree/" + src_branch
-
-pvc_name_template = "{{{{ .Release.Name }}}}-{name}"
-
-build_dir = os.path.join(os.path.dirname(__file__), "build")
-ensure_dir(build_dir)
-
-if False:
-    temp_directory = tempfile.TemporaryDirectory(dir=build_dir)
-    temp_dir = temp_directory.name
-    temp_directory.__enter__()
-else:
-    temp_dir = os.path.join(build_dir, "temp")
-    ensure_dir(temp_dir)
-
-out_dir = os.path.join(build_dir, "out")
-ensure_dir(out_dir)
-
-git_dir = os.path.join(temp_dir, "tpotce")
-
-logger.info(f"cloning {src_repo}:{src_branch}")
-subprocess.run(["git", "clone", "-b", src_branch, "--depth", "1", src_repo, git_dir], cwd=temp_dir)
-
-dock_dir = os.path.join(git_dir, "docker")
+        logging.info(f"using existing {path}")
 
 def get_compose_file(dir):
     for file in os.scandir(dir):
         if file.is_file() and re.match("docker-compose\.ya?ml", file.name):
+            logging.info(f"found {file.path}")
             return file
     else:
         return None
 
-def convert_service(name, svc):
+def convert_service(name, service, pvc_name_template="{{{{ .Release.Name }}}}-{name}", ignore_volumes=[]):
     container = {}
     volumes = {}
     extras = []
 
     container['name'] = name
-    container['image'] = svc['image']
-    if 'environment' in svc:
-        container['env'] = svc['environment']
+    container['image'] = service['image']
+    if 'environment' in service:
+        container['env'] = service['environment']
     
-    for vol_mount in svc.get('volumes', []):
+    for vol_mount in service.get('volumes', []):
         # example: vol_mount = '/data/honeypots/log:/var/log/honeypots'
         if 'volumeMounts' not in container:
             container['volumeMounts'] = []
@@ -112,7 +80,7 @@ def convert_service(name, svc):
                 }
             })
     
-    for tmpfs_mount in svc.get('tmpfs', []):
+    for tmpfs_mount in service.get('tmpfs', []):
         # example: tmpfs_mount = '/tmp/conpot:uid=2000,gid=2000'
         if 'volumeMounts' not in container:
             container['volumeMounts'] = []
@@ -142,47 +110,113 @@ def convert_service(name, svc):
             })
     
     return container, volumes, extras
+ 
+def main():
+    parser = argparse.ArgumentParser(description="Generate templates from tpot configurations.")
+    parser.add_argument('-r', '--repo', type=str, help="Git repository URL to clone from.", default="https://github.com/telekom-security/tpotce.git")
+    parser.add_argument('-b', '--branch', type=str, help="Git branch to clone.", default="master")
+    parser.add_argument('-p', '--path', type=str, help="Source path within git repo to search for services.", default="docker")
+    parser.add_argument('-d', '--dest', type=str, help="Destination directory to write templates to.", default="./out")
+    parser.add_argument('-x', '--exclude', action='extend', nargs='+', type=str, help="Don't generate based on these directories in the git repo; can specify multiple times.", default=[])
+    parser.add_argument('-m', '--mount', action='extend', nargs='+', type=str, help="Don't create PVCs for these mounts; can specify multiple times.", default=[])
+
+    parser.add_argument('-v', '--verbose', action='count', default=0)
+
+    args = parser.parse_args()
+
+    logging.basicConfig(level=max(lerp(logging.WARN, logging.INFO, args.verbose), logging.DEBUG))
+    logging.debug(f'{args}')
+
+    if args.exclude:
+        exclude = parser.exclude
+    else:
+        exclude = ['p0f', 'fatt', 'suricata', 'elk', 'ewsposter', 'nginx', 'spiderfoot', 'deprecated']
+        logging.info(f"defaulting {exclude=}")
+    
+    if args.mount:
+        mount = parser.mount
+    else:
+        mount = ['data']
+        logging.info(f"defaulting {mount=}")
+    
+    out_dir = args.dest
+    ensure_dir(out_dir)
+
+    gitignore_file = os.path.join(out_dir, ".gitignore")
+
+    src_repo = args.repo
+    src_branch = args.branch
+    repo_url_guess = src_repo.removesuffix(".git") + "/tree/" + src_branch
+    repo_name_guess = src_repo.removesuffix(".git").removesuffix("/").split("/")[-1]
+
+    with open(gitignore_file, 'w') as stream:
+        pass # truncate file to zero length
+
+    with tempfile.TemporaryDirectory(prefix=repo_name_guess + "-") as temp_dir:
+        logging.info(f"cloning {src_repo}:{src_branch} into {temp_dir}")
+        subprocess.run(["git", "clone", "-b", src_branch, "--depth", "1", src_repo, temp_dir])
+
+        search_dir = os.path.join(temp_dir, args.path)
+        
+        for container_dir in os.scandir(search_dir):
+            if not container_dir.is_dir() or container_dir.name in exclude:
+                logging.info(f"skipping {container_dir.path}")
+                continue
+            logging.info(f"scanning {container_dir.path}")
+
+            compose_file = get_compose_file(container_dir)
+            out_fname = "_" + container_dir.name + ".tpl"
+            out_file = os.path.join(out_dir, out_fname)
+
+            logging.debug(f"writing {out_file}")
+            with open(out_file, 'w') as stream: # insert source citation
+                stream.write('{{/* derived from ' + repo_url_guess + '/' + os.path.relpath(compose_file, temp_dir) + ' */}}\n')
+            
+            logging.debug(f"appending {gitignore_file}")
+            with open(gitignore_file, 'a') as stream: # add generated files to .gitignore
+                stream.writelines([out_fname, "\n"])
+
+            logging.debug(f"reading {compose_file.path}")
+            with open(compose_file, 'r') as stream:
+                contents = yaml.safe_load(stream)
+            
+            services = contents.get('services',{})
+
+            for service_name, service in services.items():
+                service_name = slugify(service_name)
+                container, volumes, extras = convert_service(service_name, service, ignore_volumes=mount)
+
+                with open(out_file, 'a') as stream:
+                    stream.writelines([
+                        '{{/* container spec and volumes for ' + service_name + ' */}}\n',
+                        '{{- define "' + service_name + '.containers" }}\n',
+                        f'## Source: {out_fname}\n',
+                    ])
+                    yaml.safe_dump([container], stream)
+                    stream.writelines([
+                        '{{- end }}\n',
+                        '{{- define "' + service_name + '.volumes" }}\n',
+                        f'## Source: {out_fname}\n',
+                    ])
+                    if volumes:
+                        yaml.safe_dump(list(volumes.values()), stream)
+                    stream.writelines([
+                        '{{- end }}\n',
+                        '{{- define "' + service_name + '.extras" }}\n',
+                        f'## Source: {out_fname}\n',
+                    ])
+                    yaml.safe_dump_all(extras, stream)
+                    stream.writelines([
+                        '{{- end }}\n',
+                    ])
+if __name__ == "__main__":
+    main()
+
         
 
-for container_dir in os.scandir(dock_dir):
-    if not container_dir.is_dir() or container_dir.name in exclude_dirs:
-        logger.info(f"skipping {container_dir.path}")
-        continue
-    logger.info(f"scanning {container_dir.path}")
 
-    compose_file = get_compose_file(container_dir)
-    out_fname = "_" + container_dir.name + ".tpl"
-    out_file = os.path.join(out_dir, out_fname)
-
-    logger.info(f"reading {compose_file.path}")
-    logger.info(f"writing {out_file}")
-    with open(out_file, 'w') as stream:
-        stream.write('{{/* derived from ' + repo_url + "/" + os.path.relpath(compose_file, git_dir) + ' */}}\n')
-
-    with open(compose_file, "r") as stream:
-        contents = yaml.safe_load(stream)
     
-    services = contents.get('services',{})
-    
-    for service_name, service in services.items():
-        service_name = slugify(service_name)
-        container, volumes, extras = convert_service(service_name, service)
 
-        with open(out_file, 'a') as stream:
-            stream.write('{{/* container spec and volumes for ' + service_name + ' */}}\n')
-            
-            stream.write('{{- define "' + service_name + '.containers" }}\n')
-            stream.write(f'## Source: {out_fname}\n')
-            yaml.safe_dump([container], stream)
-            stream.write('{{- end }}\n')
-            stream.write('{{- define "' + service_name + '.volumes" }}\n')
-            stream.write(f'## Source: {out_fname}\n')
-            yaml.safe_dump(list(volumes.values()), stream)
-            stream.write('{{- end }}\n')
-            stream.write('{{- define "' + service_name + '.extras" }}\n')
-            stream.write(f'## Source: {out_fname}\n')
-            yaml.safe_dump_all(extras, stream)
-            stream.write('{{- end }}\n')
 
         
 
